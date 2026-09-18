@@ -8,6 +8,10 @@ Breaking changes within the 0.x line are called out explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Valuation as of the run date.** SEC EDGAR serves `get_fundamentals`: market cap, enterprise value, P/E, P/S, P/B, EV/EBITDA, EV/Sales and free cash flow yield from the share count and trailing figures on file by the run date and that day's close. A historical run no longer has only a withheld-profile notice (#1300) to value a company with. Each trailing figure names the filed numbers it was built from, later splits are undone so the price is the one that traded, and an input that was not on file reads as unavailable rather than estimated.
+
 ### Fixed
 
 - SEC EDGAR cash flow statements find capital expenditure for filers that moved it to purchases of productive assets (NVIDIA since fiscal 2022, Amazon since 2016), whose recent periods read as empty.
