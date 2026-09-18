@@ -22,6 +22,7 @@ from .polymarket import get_prediction_markets as get_polymarket_prediction_mark
 from .sec_edgar import (
     get_balance_sheet as get_sec_edgar_balance_sheet,
     get_cashflow as get_sec_edgar_cashflow,
+    get_fundamentals as get_sec_edgar_fundamentals,
     get_income_statement as get_sec_edgar_income_statement,
 )
 from .y_finance import (
@@ -112,6 +113,7 @@ VENDOR_METHODS = {
     # fundamental_data
     "get_fundamentals": {
         "alpha_vantage": get_alpha_vantage_fundamentals,
+        "sec_edgar": get_sec_edgar_fundamentals,
         "yfinance": get_yfinance_fundamentals,
     },
     "get_balance_sheet": {
