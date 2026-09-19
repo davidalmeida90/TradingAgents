@@ -87,20 +87,8 @@ _SPANS = {"quarterly": (60, 115), "annual": (300, 400)}
 # A year to date, longest first: nine months, six, then the first quarter alone.
 _YEAR_TO_DATE = ((240, 295), (150, 205), (60, 115))
 
-# Lines a valuation needs beyond the statement rows above, same order rule.
-_VALUATION_TAGS: dict[str, tuple[str, ...]] = {
-    "Depreciation and Amortization": ("DepreciationDepletionAndAmortization",
-                                      "DepreciationAmortizationAndAccretionNet",
-                                      "DepreciationAndAmortization"),
-    "Marketable Securities": ("MarketableSecuritiesCurrent",
-                              "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
-                              "ShortTermInvestments"),
-}
-_VALUATION_TAGS.update({label: tags for rows in _STATEMENTS.values() for label, tags in rows})
-
-# Borrowings are separate lines that add up, unlike alternative tags for one line.
-_DEBT_LINES = ("LongTermDebtNoncurrent", "LongTermDebtCurrent", "CommercialPaper",
-               "ShortTermBorrowings")
+# Statement lines by label, so the valuation reads the same tags as the statements.
+_TAGS = {label: tags for rows in _STATEMENTS.values() for label, tags in rows}
 
 # The newest filed period can trail the date by a quarter plus a filing deadline.
 # Anything older means the company stopped filing, and a multiple would mislead.
@@ -361,7 +349,8 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
 
     Name, sector, beta, dividend yield and forward estimates have no filed
     vintage, so they are not served; the report says so rather than leaving a gap
-    the agent might fill from memory.
+    the agent might fill from memory. Enterprise value is left out as well: debt
+    is tagged too differently from one filer to the next to net it reliably.
     """
     curr_date = curr_date or datetime.now().strftime("%Y-%m-%d")
     cik = cik_for(ticker)
@@ -384,66 +373,34 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
             share_count *= ratio
     market_cap = close * share_count
 
-    def trailing(tags: tuple[str, ...]) -> dict | None:
-        item = _trailing_year(us_gaap, tags, curr_date)
-        return item if item and _days_between(item["end"], curr_date) <= _STALE_AFTER_DAYS else None
+    def recent(end: str) -> bool:
+        return _days_between(end, curr_date) <= _STALE_AFTER_DAYS
 
-    flows = {label: trailing(_VALUATION_TAGS[label])
-             for label in ("Revenue", "Net Income", "Operating Income",
-                           "Depreciation and Amortization", "Operating Cash Flow",
-                           "Capital Expenditure")}
-    # Some filers tag depreciation alone and amortization elsewhere. EBITDA built on
-    # it runs a little low, so the row says which figure it used.
-    depreciation_only = ""
-    if flows["Depreciation and Amortization"] is None:
-        flows["Depreciation and Amortization"] = trailing(("Depreciation",))
-        if flows["Depreciation and Amortization"]:
-            depreciation_only = " (depreciation only, this filer tags amortization separately)"
+    flows = {label: _trailing_year(us_gaap, _TAGS[label], curr_date)
+             for label in ("Revenue", "Net Income", "Operating Cash Flow", "Capital Expenditure")}
+    flows = {label: item if item and recent(item["end"]) else None for label, item in flows.items()}
 
     def flow(label: str) -> float | None:
         return flows[label]["value"] if flows[label] else None
 
-    def same_period(*labels: str) -> bool:
-        return all(flows[x] for x in labels) and len({flows[x]["end"] for x in labels}) == 1
+    cash_flow, capex = flows["Operating Cash Flow"], flows["Capital Expenditure"]
+    # Both halves of free cash flow have to cover the same twelve months.
+    free_cash = (cash_flow["value"] - capex["value"]
+                 if cash_flow and capex and cash_flow["end"] == capex["end"] else None)
+    book = _newest(us_gaap, _TAGS["Stockholders Equity"], curr_date)
+    book = book if book and recent(book[0]) else None
 
-    # One balance sheet date for every balance, so cash from one quarter is never
-    # netted against debt from another.
-    balance = _newest(us_gaap, _VALUATION_TAGS["Total Assets"], curr_date)
-    balance_date = balance[0] if balance else None
-    if balance_date and _days_between(balance_date, curr_date) > _STALE_AFTER_DAYS:
-        balance_date = None
-
-    def at_balance_date(tags: tuple[str, ...]) -> float | None:
-        found = _newest(us_gaap, tags, curr_date)
-        return found[1] if found and found[0] == balance_date else None
-
-    equity = at_balance_date(_VALUATION_TAGS["Stockholders Equity"])
-    cash = at_balance_date(_VALUATION_TAGS["Cash and Equivalents"])
-    securities = at_balance_date(_VALUATION_TAGS["Marketable Securities"])
-    debt_lines = {tag: at_balance_date((tag,)) for tag in _DEBT_LINES}
-    debt_lines = {tag: value for tag, value in debt_lines.items() if value is not None}
-    if not debt_lines:
-        total = at_balance_date(("LongTermDebt",))
-        debt_lines = {"LongTermDebt": total} if total is not None else {}
-    debt = sum(debt_lines.values())
-    enterprise = market_cap + debt - cash - (securities or 0) if cash is not None else None
-    ebitda = (flow("Operating Income") + flow("Depreciation and Amortization")
-              if same_period("Operating Income", "Depreciation and Amortization") else None)
-    free_cash = (flow("Operating Cash Flow") - flow("Capital Expenditure")
-                 if same_period("Operating Cash Flow", "Capital Expenditure") else None)
-
-    def multiple(top: float | None, bottom: float | None) -> str:
-        if top is None or bottom is None:
+    def multiple(bottom: float | None) -> str:
+        if bottom is None:
             return "unavailable (an input was not on file)"
         if bottom <= 0:
             return "not meaningful (the denominator is zero or negative)"
-        return f"{top / bottom:.1f}x"
+        return f"{market_cap / bottom:.1f}x"
 
     def millions(value: float | None) -> str:
         return "unavailable" if value is None else f"{value / 1e6:.0f}"
 
     adjusted = "" if share_count == shares[1] else ", restated for the split since"
-    debt_note = " + ".join(debt_lines) if debt_lines else "no borrowing line tagged, counted as none"
     lines = [
         f"# Company Fundamentals for {ticker.upper()}, USD in millions unless the row says otherwise",
         f"# Point-in-time as of: {curr_date}",
@@ -454,12 +411,9 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
         f"Price (USD per share): {close:.2f}",
         f"Shares Outstanding (millions): {share_count / 1e6:.1f} (counted {counted_on}{adjusted})",
         f"Market Cap: {millions(market_cap)}",
-        f"Enterprise Value: {millions(enterprise)} (debt: {debt_note})",
-        f"PE Ratio (TTM): {multiple(market_cap, flow('Net Income'))}",
-        f"Price to Sales (TTM): {multiple(market_cap, flow('Revenue'))}",
-        f"Price to Book: {multiple(market_cap, equity)}",
-        f"EV to EBITDA (TTM): {multiple(enterprise, ebitda)}",
-        f"EV to Sales (TTM): {multiple(enterprise, flow('Revenue'))}",
+        f"PE Ratio (TTM): {multiple(flow('Net Income'))}",
+        f"Price to Sales (TTM): {multiple(flow('Revenue'))}",
+        f"Price to Book: {multiple(book[1] if book else None)}",
         "Free Cash Flow Yield (TTM): " + (
             f"{free_cash / market_cap:.2%}" if free_cash is not None
             else "unavailable (an input was not on file)"),
@@ -470,13 +424,7 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
         lines.append(f"{label} (TTM): " + (f"{millions(item['value'])} = {item['parts']}" if item
                                            else "unavailable (a part was not on file)"))
     lines += [
-        f"EBITDA (TTM): {millions(ebitda)}{depreciation_only if ebitda is not None else ''}",
         f"Free Cash Flow (TTM): {millions(free_cash)}",
-        "",
-        f"# Balances at {balance_date or 'no recent balance sheet'}",
-        f"Stockholders Equity: {millions(equity)}",
-        f"Cash and Equivalents: {millions(cash)}",
-        f"Marketable Securities: {millions(securities)}",
-        f"Debt: {millions(debt) if debt_lines else 'none tagged'}",
+        f"Stockholders Equity: {millions(book[1]) + f' (at {book[0]})' if book else 'unavailable'}",
     ]
     return "\n".join(lines) + "\n"

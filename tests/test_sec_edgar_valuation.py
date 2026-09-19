@@ -92,7 +92,6 @@ def test_the_multiples_use_that_day_s_close_and_the_count_on_file():
     assert _row(out, "PE Ratio (TTM)") == "PE Ratio (TTM): 10.0x"  # 1100 / 110
     assert _row(out, "Price to Sales (TTM)") == "Price to Sales (TTM): 1.1x"  # 1100 / 1000
     assert _row(out, "Price to Book") == "Price to Book: 2.2x"    # 1100 / 500
-    assert _row(out, "Enterprise Value").startswith("Enterprise Value: 1240 ")  # + 200 - 60
 
 
 @pytest.mark.unit
@@ -166,18 +165,9 @@ def test_a_loss_has_no_price_to_earnings(monkeypatch):
 @pytest.mark.unit
 def test_an_input_that_was_never_filed_is_named_unavailable_not_guessed():
     out = sec_edgar.get_fundamentals("ACME", "2025-09-15")
-    assert "unavailable" in _row(out, "EV to EBITDA (TTM)")   # no depreciation tagged
-    assert "unavailable" in _row(out, "Free Cash Flow Yield (TTM)")
+    assert "unavailable" in _row(out, "Free Cash Flow Yield (TTM)")   # no cash flow tagged
     assert _row(out, "PE Ratio (TTM)") == "PE Ratio (TTM): 10.0x"  # the rest still returns
 
-
-@pytest.mark.unit
-def test_cash_and_debt_come_from_one_balance_sheet_date():
-    """Debt is tagged only at mid 2025; before that filing there is none to net."""
-    out = sec_edgar.get_fundamentals("ACME", "2025-07-15")
-    assert "# Balances at 2024-12-31" in out
-    assert _row(out, "Debt") == "Debt: none tagged"
-    assert _row(out, "Enterprise Value").startswith("Enterprise Value: 1010 ")  # 1100 - 90
 
 
 @pytest.mark.unit
@@ -206,17 +196,13 @@ def test_the_vendor_is_routable_for_fundamentals():
 
 
 @pytest.mark.unit
-def test_depreciation_alone_is_used_and_named_when_that_is_all_the_filer_tags(monkeypatch):
-    """Several large filers tag depreciation and amortization as separate lines."""
-    import copy
+def test_book_value_older_than_the_stale_guard_is_not_used():
+    """Equity is on file only at mid 2025; a year later it no longer prices the book."""
+    out = sec_edgar.get_fundamentals("ACME", "2026-03-01")
+    assert "unavailable" in _row(out, "Price to Book")
 
-    facts = copy.deepcopy(FACTS)
-    gaap = facts["facts"]["us-gaap"]
-    gaap["OperatingIncomeLoss"] = _usd(
-        _fact("2024-12-31", 150e6, "2025-02-10", start="2024-01-01", form="10-K"))
-    gaap["Depreciation"] = _usd(
-        _fact("2024-12-31", 50e6, "2025-02-10", start="2024-01-01", form="10-K"))
-    monkeypatch.setattr(sec_edgar, "_fetch_json",
-                        lambda url: TICKER_MAP if "company_tickers" in url else facts)
-    out = sec_edgar.get_fundamentals("ACME", "2025-03-01")
-    assert _row(out, "EBITDA (TTM)").startswith("EBITDA (TTM): 200 (depreciation only")
+
+@pytest.mark.unit
+def test_enterprise_value_is_deliberately_not_served():
+    out = sec_edgar.get_fundamentals("ACME", "2025-09-15")
+    assert "Enterprise Value" not in out and "EBITDA" not in out

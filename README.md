@@ -264,7 +264,7 @@ EDGAR needs no account or API key. Add the vendor to the chain:
 config["data_vendors"]["fundamental_data"] = "sec_edgar,yfinance"
 ```
 
-The same chain gives a past date its valuation. Vendor profiles carry today's market cap and multiples, so they are withheld from a historical run; with EDGAR in the chain, `get_fundamentals` serves market cap, enterprise value, P/E, P/S, P/B, EV/EBITDA and free cash flow yield as they stood that day, from the share count and trailing figures on file by then and that day's close, with every trailing figure shown as the filed numbers it was built from. Name, sector, beta and forward estimates have no filed vintage and are not served.
+The same chain gives a past date its valuation. Vendor profiles carry today's market cap and multiples, so they are withheld from a historical run; with EDGAR in the chain, `get_fundamentals` serves market cap, P/E, P/S, P/B and free cash flow yield as they stood that day, from the share count and trailing figures on file by then and that day's close, with every trailing figure shown as the filed numbers it was built from. Name, sector, beta and forward estimates have no filed vintage and are not served.
 
 SEC asks callers to identify themselves and refuses requests that carry no contact address, so a default one is sent. Set your own so SEC can reach you rather than the project:
 
