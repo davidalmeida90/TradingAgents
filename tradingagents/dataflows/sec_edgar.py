@@ -331,26 +331,43 @@ def get_valuation(ticker: str, curr_date: str | None = None) -> str:
         eps_basis = "quarterly"
     price, price_date = _last_settled_close(ticker, curr_date)
 
+    # Yahoo restates every past close for splits that came later (NVDA traded at
+    # 903.56 on 2024-03-28 and reads as ~90 after the June 2024 10-for-1), while
+    # a filed share count and a filed EPS sit on the share basis of the day they
+    # were measured or filed. Everything is put on the basis of the price
+    # session before it is combined, or each multiple is off by the split ratio.
+    splits = _split_history(ticker) if price is not None else {}
+    later = _split_factor(splits, price_date, None)
+    if price is not None:
+        price *= later
+    share_count = shares[2] * _split_factor(splits, shares[0], price_date) if shares else None
+    eps_value = None
+    if eps is not None:
+        eps_filed = _filed_on(us_gaap, ("EarningsPerShareDiluted",), eps[0], curr_date)
+        eps_value = eps[1] / _split_factor(splits, eps_filed, price_date)
+
     rows: list[tuple[str, str, str]] = [
         ("Close", f"{price:.2f} USD" if price is not None else "unavailable",
-         price_date or "no settled close on or before the analysis date"),
+         (f"{price_date}, as traded (later splits undone)" if later != 1 else price_date)
+         or "no settled close on or before the analysis date"),
     ]
 
     if shares is not None:
-        rows.append(("Shares Outstanding (cover page)", f"{shares[2]:,.0f}",
-                     f"measured {shares[0]}, filed {shares[1]}"))
+        restated = ", restated for the split since" if share_count != shares[2] else ""
+        rows.append(("Shares Outstanding (cover page)", f"{share_count:,.0f}",
+                     f"measured {shares[0]}, filed {shares[1]}{restated}"))
     else:
         rows.append(("Shares Outstanding (cover page)", "unavailable",
                      "no cover page count filed by the analysis date"))
 
     if price is not None and shares is not None:
-        rows.append(("Market Cap", f"{price * shares[2] / 1e9:.2f}B USD",
+        rows.append(("Market Cap", f"{price * share_count / 1e9:.2f}B USD",
                      f"close {price_date} x shares measured {shares[0]} (filed {shares[1]})"))
     else:
         rows.append(("Market Cap", "unavailable", "needs both a close and a share count"))
 
     if price is not None and equity is not None and equity[1] and shares:
-        book_per_share = equity[1] / shares[2]
+        book_per_share = equity[1] / share_count
         if book_per_share <= 0:
             # Negative equity is a real state (insolvency), but a negative
             # multiple reads as a cheapness signal an agent will act on.
@@ -363,12 +380,12 @@ def get_valuation(ticker: str, curr_date: str | None = None) -> str:
         rows.append(("Price / Book", "unavailable",
                      "needs a close, a share count and filed stockholders equity"))
 
-    if price is not None and eps is not None and eps[1]:
-        if eps[1] < 0:
+    if price is not None and eps is not None and eps_value:
+        if eps_value < 0:
             rows.append(("Price / Earnings", "not meaningful",
-                         f"diluted EPS is {eps[1]:.2f} for period ending {eps[0]} ({eps_basis})"))
+                         f"diluted EPS is {eps_value:.2f} for period ending {eps[0]} ({eps_basis})"))
         else:
-            rows.append(("Price / Earnings", f"{price / eps[1]:.2f}",
+            rows.append(("Price / Earnings", f"{price / eps_value:.2f}",
                          f"close {price_date} / diluted EPS for period ending {eps[0]} ({eps_basis})"))
     else:
         rows.append(("Price / Earnings", "unavailable",
@@ -378,6 +395,43 @@ def get_valuation(ticker: str, curr_date: str | None = None) -> str:
                  "not derivable from filings: they carry carrying values, not the market value of debt"))
 
     return _valuation_markdown(f"Valuation snapshot for {ticker.upper()}", curr_date, rows)
+
+
+def _split_history(ticker: str) -> dict[str, float]:
+    """{split date: ratio} from Yahoo; empty when the history cannot be read."""
+    try:
+        import yfinance as yf
+
+        from .stockstats_utils import yf_retry
+        from .symbol_utils import normalize_symbol
+
+        handle = yf.Ticker(normalize_symbol(ticker))
+        return {when.date().isoformat(): float(ratio)
+                for when, ratio in yf_retry(lambda: handle.splits).items() if ratio}
+    except Exception as exc:  # noqa: BLE001 (the snapshot is still served without it)
+        logger.warning("No split history for %s: %s", ticker, exc)
+        return {}
+
+
+def _split_factor(splits: dict[str, float], after: str | None, through: str | None) -> float:
+    """Product of the split ratios dated after ``after`` and on or before ``through``."""
+    if not after:
+        return 1.0
+    factor = 1.0
+    for when, ratio in splits.items():
+        if when > after and (through is None or when <= through):
+            factor *= ratio
+    return factor
+
+
+def _filed_on(facts: dict, tags: tuple[str, ...], end: str, curr_date: str) -> str | None:
+    """Filing date of the newest fact for period ``end`` known by ``curr_date``."""
+    for tag in tags:
+        filed = [fact["filed"] for unit_values in ((facts.get(tag) or {}).get("units", {})).values()
+                 for fact in unit_values if fact["end"] == end and fact["filed"] <= curr_date]
+        if filed:
+            return max(filed)
+    return None
 
 
 def _last_settled_close(ticker: str, curr_date: str) -> tuple[float | None, str | None]:

@@ -77,6 +77,7 @@ def _no_network_or_cache(tmp_path, monkeypatch):
         sec_edgar, "load_ohlcv",
         lambda symbol, curr_date, fill_gaps=True: PRICE_FRAME.copy(),
     )
+    monkeypatch.setattr(sec_edgar, "_split_history", lambda ticker: {})
 
 
 @pytest.mark.unit
@@ -217,3 +218,37 @@ def test_negative_equity_reports_not_meaningful_not_a_negative_multiple():
         out = sec_edgar.get_valuation("AAPL", "2023-11-15")
     assert "not meaningful" in out
     assert "book value per share is -0.26" in out  # -4e9 / 15.55B shares
+
+
+# --- splits: the adjusted close, the filed count and the filed EPS on one basis ---
+
+@pytest.mark.unit
+def test_a_later_split_is_undone_on_the_close(monkeypatch):
+    # Yahoo's 188.01 for 2023-11-15 would already be divided by a 10-for-1
+    # dated after it; the stock traded at 1880.10 that day.
+    monkeypatch.setattr(sec_edgar, "_split_history", lambda ticker: {"2024-06-10": 10.0})
+    out = sec_edgar.get_valuation("AAPL", "2023-11-15")
+    assert "1880.10 USD" in out
+    assert "as traded (later splits undone)" in out
+    # 1880.10 * 15,550,061,000 = 29,235.67B: the count is on the 2023 basis too
+    assert "29235.67B USD" in out
+
+
+@pytest.mark.unit
+def test_a_count_measured_before_a_split_is_restated(monkeypatch):
+    # Cover measured 2023-09-30, 2-for-1 on 2023-10-15, close 2023-11-15.
+    monkeypatch.setattr(sec_edgar, "_split_history", lambda ticker: {"2023-10-15": 2.0})
+    out = sec_edgar.get_valuation("AAPL", "2023-11-15")
+    assert "31,100,122,000" in out
+    assert "restated for the split since" in out
+    assert "5847.13B USD" in out
+    # EPS was filed on 2023-11-03, after the split, so it is already on the new basis
+    assert "30.67" in out
+
+
+@pytest.mark.unit
+def test_eps_filed_before_a_split_is_restated(monkeypatch):
+    # EPS filed 2023-11-03, 2-for-1 on 2023-11-10, close 2023-11-15: 188.01 / (6.13 / 2)
+    monkeypatch.setattr(sec_edgar, "_split_history", lambda ticker: {"2023-11-10": 2.0})
+    out = sec_edgar.get_valuation("AAPL", "2023-11-15")
+    assert "61.34" in out
