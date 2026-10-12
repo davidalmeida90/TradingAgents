@@ -10,6 +10,11 @@ serves exactly what was on file by then, restatements included at the vintage
 that was current: Apple's 2008 total assets read 39.6B until the 2010 amendment
 restated them to 36.2B.
 
+The same rule gives a past date its valuation (#1374). Vendor profiles carry
+today's market cap and multiples, so a historical run gets none (#1300) and reads
+statements with no price attached. ``get_fundamentals`` prices what was on file
+by the date at that day's close, for past dates only.
+
 Access needs no key or account, only a User-Agent identifying the caller, which
 SEC requires and refuses requests without. US filers only: anything absent from
 EDGAR's ticker map falls through to the next configured vendor.
@@ -21,13 +26,14 @@ import json
 import logging
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
 
 from tradingagents import __version__
 from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows.date_window import is_historical
 from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
 from tradingagents.dataflows.files import replace_file
 
@@ -87,6 +93,14 @@ _YEAR_TO_DATE = ((150, 200, 6), (240, 290, 9))
 # check, so either would read as a fiscal year. The value is still the latest
 # filing of any form: a recast after a split or spin-off counts from its filing.
 _ANNUAL_FORMS = ("10-K", "20-F", "40-F")
+
+# Statement lines by label, so a valuation reads the same tags the statements do.
+_TAGS = {label: tags for rows in _STATEMENTS.values() for label, tags in rows}
+
+# A share count or balance older than this means the company stopped filing; a
+# multiple on it would mislead. A fiscal year may trail the date by up to a year
+# plus the annual filing deadline.
+_STALE_AFTER_DAYS = {"count": 200, "fiscal year": 460}
 
 
 def _user_agent() -> str:
@@ -255,3 +269,127 @@ def get_income_statement(ticker: str, freq: str = "quarterly", as_of_date: str |
 def get_cashflow(ticker: str, freq: str = "quarterly", as_of_date: str | None = None) -> str:
     """Cash flow statement as filed on or before ``as_of_date``."""
     return _statement("cashflow", ticker, freq, as_of_date, "Cash Flow Statement")
+
+
+def _days(start: str, end: str) -> int:
+    return (date.fromisoformat(end) - date.fromisoformat(start)).days
+
+
+def _newest(facts: dict, tags: tuple[str, ...], as_of_date: str, spans: tuple[tuple[int, int], ...],
+            forms: tuple[str, ...] = (), stale: str = "count") -> tuple[str, float] | None:
+    """(period end, value) of the newest figure on file by the date, unless it is stale."""
+    values, _ = _as_of(facts, tags, as_of_date, spans, forms)
+    if not values:
+        return None
+    (end, _), value = max(values.items())
+    return (end, value) if _days(end, as_of_date) <= _STALE_AFTER_DAYS[stale] else None
+
+
+def _shares(all_facts: dict, as_of_date: str) -> tuple[str, float] | None:
+    """(date counted, shares) from the filing cover page, else the balance sheet.
+
+    A company with several share classes files no single cover-page total, so its
+    count there goes stale and the balance sheet count stands in.
+    """
+    return (_newest(all_facts.get("dei") or {}, ("EntityCommonStockSharesOutstanding",), as_of_date,
+                    (_SPANS["quarterly"],))
+            or _newest(all_facts.get("us-gaap") or {}, ("CommonStockSharesOutstanding",), as_of_date,
+                       (_SPANS["quarterly"],)))
+
+
+def _close(ticker: str, as_of_date: str) -> tuple[float, str, dict[str, float]]:
+    """(close, session, {split date: ratio}) for the last session on or before the date.
+
+    Yahoo restates every past close for the splits that came after it, so the
+    close it serves for a past date is not the price that traded. Later splits
+    are undone here, which puts the price on the share basis of its own date, the
+    basis the filed share count is on.
+    """
+    import yfinance as yf
+
+    from tradingagents.dataflows.symbols import normalize_symbol
+    from tradingagents.dataflows.vendors.yahoo.common import yf_retry
+
+    symbol = normalize_symbol(ticker)
+    handle = yf.Ticker(symbol)
+    day = date.fromisoformat(as_of_date)
+    history = yf_retry(lambda: handle.history(start=(day - timedelta(days=10)).isoformat(),
+                                              end=(day + timedelta(days=1)).isoformat(),
+                                              auto_adjust=False))
+    closes = None if history is None or history.empty else history["Close"].dropna()
+    if closes is None or closes.empty:
+        raise NoMarketDataError(ticker, symbol, f"no closing price on or before {as_of_date}")
+    session = closes.index[-1].date().isoformat()
+    splits = {when.date().isoformat(): float(ratio)
+              for when, ratio in yf_retry(lambda: handle.splits).items() if ratio}
+    close = float(closes.iloc[-1])
+    for when, ratio in splits.items():
+        if when > session:
+            close *= ratio
+    return close, session, splits
+
+
+def get_fundamentals(ticker: str, as_of_date: str | None = None) -> str:
+    """Valuation as it stood on a past ``as_of_date``: that day's close against what was on file.
+
+    Every figure is one a filing states. The multiples use the last fiscal year
+    reported in an annual report, the newest equity on file and the newest share
+    count; a trailing twelve months is never built by subtracting one filing from
+    another. Name, sector, beta and forward estimates have no filed vintage and
+    are not served. A run dated today gets the next vendor's live profile.
+    """
+    if not is_historical(as_of_date):
+        raise NoMarketDataError(ticker, ticker, "serves past dates only; today's profile comes "
+                                                "from the next configured vendor")
+    cik = cik_for(ticker)
+    if cik is None:
+        raise NoMarketDataError(ticker, ticker, "not a US SEC filer")
+    all_facts = _cached_json(_FACTS_URL.format(cik=cik), f"CIK{cik}.json").get("facts") or {}
+    us_gaap = all_facts.get("us-gaap")
+    if not us_gaap:
+        raise NoMarketDataError(ticker, ticker, "US filer with no us-gaap facts")
+    shares = _shares(all_facts, as_of_date)
+    if shares is None:
+        raise NoMarketDataError(ticker, ticker, f"no share count filed near {as_of_date}")
+
+    close, session, splits = _close(ticker, as_of_date)
+    counted, count = shares
+    # A split between the count and the session changes the count, not the company.
+    for when, ratio in splits.items():
+        if counted < when <= session:
+            count *= ratio
+    market_cap = close * count
+
+    year = {label: _newest(us_gaap, _TAGS[label], as_of_date, (_SPANS["annual"],), _ANNUAL_FORMS,
+                           "fiscal year") for label in ("Net Income", "Revenue")}
+    book = _newest(us_gaap, _TAGS["Stockholders Equity"], as_of_date, (_SPANS["quarterly"],))
+
+    def multiple(name: str, figure: tuple[str, float] | None, basis: str) -> str:
+        if figure is None:
+            return f"{name}: unavailable (not on file by {as_of_date})"
+        value = (f"{market_cap / figure[1]:.1f}x" if figure[1] > 0
+                 else "not meaningful (zero or negative denominator)")
+        return f"{name} ({basis} {figure[0]}): {value}"
+
+    def millions(label: str, figure: tuple[str, float] | None, basis: str) -> str:
+        return (f"{label} ({basis} {figure[0]}): {figure[1] / 1e6:.0f}" if figure
+                else f"{label}: unavailable (not on file by {as_of_date})")
+
+    restated = "" if count == shares[1] else ", restated for the split since"
+    lines = [
+        f"# Company Fundamentals for {ticker.upper()}, USD in millions unless the row says otherwise",
+        f"# Point-in-time as of: {as_of_date}",
+        f"# SEC EDGAR facts filed on or before {as_of_date}, priced at the {session} close",
+        "# Name, sector, beta and forward estimates have no filed vintage and are not served.",
+        "",
+        f"Price (USD per share): {close:.2f}",
+        f"Shares Outstanding (millions): {count / 1e6:.1f} (counted {counted}{restated})",
+        f"Market Cap: {market_cap / 1e6:.0f}",
+        multiple("PE Ratio", year["Net Income"], "fiscal year to"),
+        multiple("Price to Sales", year["Revenue"], "fiscal year to"),
+        multiple("Price to Book", book, "equity at"),
+        millions("Net Income", year["Net Income"], "fiscal year to"),
+        millions("Revenue", year["Revenue"], "fiscal year to"),
+        millions("Stockholders Equity", book, "at"),
+    ]
+    return "\n".join(lines) + "\n"
